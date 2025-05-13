@@ -11,38 +11,69 @@ import dezero.functions as F
 import dezero.layers as L
 from dezero import optimizers
 import dezero as dezero
+import datetime
+import os
 
-# --- 상태 정규화 ---
+import imageio
+from moviepy.editor import ImageSequenceClip
+
+def save_model(agent, reward, episode):
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+
+    save_dir = "saved_models"
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    filename = f"{timestamp}_ep{episode}_reward{int(reward)}.npz"
+    save_path = os.path.join(save_dir, filename)
+
+    model_params = {}
+    for name, param in agent.qnet.__dict__.items():
+        if isinstance(param, dezero.Parameter):
+            model_params[name] = param.data
+
+    np.savez(save_path,
+             **model_params,
+             epsilon=agent.epsilon,
+             episode=episode,
+             reward=reward)
+
+    print(f"모델이 저장되었습니다: {filename}")
+
 def normalize(state):
     pos = (state[0] + 1.2) / 1.8
     vel = (state[1] + 0.07) / 0.14
     return np.array([pos, vel], dtype=np.float32)
 
-# --- Replay Buffer ---
 class ReplayBuffer:
-    def __init__(self, size, batch_size):
-        self.buffer = deque(maxlen=size)
+    def __init__(self, buffer_size, batch_size):
+        self.buffer = deque(maxlen=buffer_size)
         self.batch_size = batch_size
 
-    def add(self, s, a, r, s2, d):
-        self.buffer.append((s, a, r, s2, d))
+    def add(self, state, action, reward, next_state, done):
+        data = (state, action, reward, next_state, done)
+        self.buffer.append(data)
 
-    def sample(self):
-        batch = random.sample(self.buffer, self.batch_size)
-        s = np.stack([x[0] for x in batch])
-        a = np.array([x[1] for x in batch])
-        r = np.array([x[2] for x in batch])
-        s2 = np.stack([x[3] for x in batch])
-        d = np.array([x[4] for x in batch]).astype(np.int32)
-        return s, a, r, s2, d
+    def __len__(self):
+        return len(self.buffer)
+    
+    def get_batch(self):
+        data = random.sample(self.buffer, self.batch_size)
 
-# --- Q-Network ---
+        state = np.stack([x[0] for x in data])
+        action = np.array([x[1] for x in data])
+        reward = np.array([x[2] for x in data])
+        next_state = np.stack([x[3] for x in data])
+        done = np.array([x[4] for x in data]).astype(np.int32)
+        return state, action, reward, next_state, done
+
 class QNet(Model):
     def __init__(self, action_size):
         super().__init__()
         self.l1 = L.Linear(128)
-        self.l2 = L.Linear(128)
-        self.l3 = L.Linear(64)
+        self.l2 = L.Linear(64)
+        self.l3 = L.Linear(64)  
         self.out = L.Linear(action_size)
 
     def forward(self, x):
@@ -51,41 +82,45 @@ class QNet(Model):
         x = F.relu(self.l3(x))
         return self.out(x)
 
-# --- DQN Agent ---
 class DQNAgent:
-    def __init__(self, action_size, buffer_size=10000, batch_size=64):
-        self.gamma = 0.99
-        self.lr = 1e-3
+    def __init__(self):
+        self.gamma = 0.98
+        self.lr = 0.0001
         self.epsilon = 1.0
-        self.epsilon_min = 0.05
+        self.epsilon_min = 0.01
         self.epsilon_decay = 0.995
-        self.action_size = action_size
-        self.batch_size = batch_size
+        self.buffer_size = 10000
+        self.batch_size = 64
+        self.action_size = 3
 
-        self.qnet = QNet(action_size)
-        self.qnet_target = copy.deepcopy(self.qnet)
+        self.replay_buffer = ReplayBuffer(self.buffer_size, self.batch_size)
+        self.qnet = QNet(self.action_size)
+        self.qnet_target = QNet(self.action_size)
+        # self.optimizer = optimizers.SGD(self.lr)
         self.optimizer = optimizers.Adam(self.lr)
         self.optimizer.setup(self.qnet)
-        self.buffer = ReplayBuffer(buffer_size, batch_size)
 
     def get_action(self, state):
         if np.random.rand() < self.epsilon:
-            return np.random.randint(self.action_size)
-        q = self.qnet(state[np.newaxis, :])
-        return int(q.data.argmax())
+            return np.random.choice(self.action_size)
+        else:
+            state = state[np.newaxis, :]
+            qs = self.qnet(state)
+            return qs.data.argmax()
 
-    def update(self):
-        if len(self.buffer.buffer) < self.batch_size:
+    def update(self, state, action, reward, next_state, done):
+        self.replay_buffer.add(state, action, reward, next_state, done)
+        if len(self.replay_buffer) < self.batch_size:
             return
 
-        s, a, r, s2, d = self.buffer.sample()
-        q_values = self.qnet(s)
-        q = q_values[np.arange(len(a)), a]
+        state, action, reward, next_state, done = self.replay_buffer.get_batch()
+        qs = self.qnet(state)
+        q = qs[np.arange(self.batch_size), action]
 
-        with dezero.no_grad():
-            next_q = self.qnet_target(s2)
-            q_max = next_q.max(axis=1)
-            target = r + (1 - d) * self.gamma * q_max
+        next_qs = self.qnet_target(next_state)
+        next_q = next_qs.max(axis=1)
+        next_q.unchain()
+        target = reward + (1 - done) * self.gamma * next_q
 
         loss = F.mean_squared_error(q, target)
 
@@ -93,73 +128,109 @@ class DQNAgent:
         loss.backward()
         self.optimizer.update()
 
-    def sync(self):
+    def sync_qnet(self):
         self.qnet_target = copy.deepcopy(self.qnet)
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-# --- 학습 환경 설정 ---
+episodes = 10000
+sync_interval = 40
 env = gym.make("MountainCar-v0", render_mode="rgb_array")
-agent = DQNAgent(action_size=3, buffer_size=10000, batch_size=64)
+agent = DQNAgent()
+reward_history = []
 
-episodes = 200
-sync_interval = 20
-reward_log = []
-
-for ep in range(episodes):
-    state = normalize(env.reset()[0])
+for episode in range(episodes):
+    state = env.reset()[0]
     done = False
     total_reward = 0
 
     while not done:
         action = agent.get_action(state)
-        next_raw, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        next_state = normalize(next_raw)
+        next_state, reward, terminated, truncated, info = env.step(action)
+        done = terminated | truncated
+        # reward = custom_reward(state, action, next_state)
 
-        # 원래 환경 보상 사용
-        reward = -1.0
-
-        if next_raw[0] >= 0.5:
-            print(f"🏁 Goal reached at episode {ep}")
-
-        agent.buffer.add(state, action, reward, next_state, done)
-        agent.update()
-
-        total_reward += reward
+        agent.update(state, action, reward, next_state, done)
         state = next_state
+        total_reward += reward
+
+    if episode % sync_interval == 0:
+        agent.sync_qnet()
 
     agent.decay_epsilon()
-    if ep % sync_interval == 0:
-        agent.sync()
 
-    reward_log.append(total_reward)
-    print(f"[{ep}] reward: {total_reward:.2f}, epsilon: {agent.epsilon:.3f}")
+    reward_history.append(total_reward)
+    if episode % 10 == 0:
+        print("episode :{}, total reward : {}".format(episode, total_reward))
+    if (episode > 1000 and episode % 500 == 0) or (episode == episodes - 1):
+        save_model(agent, total_reward, episode)
 
-# --- 보상 시각화 ---
-plt.plot(reward_log)
-plt.xlabel("Episode")
-plt.ylabel("Total Reward")
-plt.title("MountainCar-v0 DQN 원래 환경 학습 결과")
-plt.grid()
+plt.xlabel('Episode')
+plt.ylabel('Total Reward')
+plt.plot(range(len(reward_history)), reward_history)
+
+
+
+now = datetime.datetime.now()
+exp_dir = f"test_results/{now.strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(exp_dir, exist_ok=True)
+graph_path = os.path.join(exp_dir, "reward_history.png")
+plt.savefig(graph_path, dpi=150)  # 해상도는 필요에 따라 조정
 plt.show()
+# --- 파라미터 저장 ---
+params_text = f"""
+gamma = {agent.gamma}
+lr = {agent.lr}
+epsilon = {agent.epsilon}
+epsilon_min = {agent.epsilon_min}
+epsilon_decay = {agent.epsilon_decay}
+buffer_size = {agent.buffer_size}
+batch_size = {agent.batch_size}
+action_size = {agent.action_size}
+episodes = {episodes}
+sync_interval = {sync_interval}
+QNet 구조: {agent.qnet.l1.out_size}-{agent.qnet.l2.out_size}-{agent.qnet.l3.out_size}-{agent.qnet.out.out_size}
+"""
+with open(os.path.join(exp_dir, "params.txt"), "w", encoding="utf-8") as f:
+    f.write(params_text)
 
-# --- 테스트 실행 ---
-env_test = gym.make("MountainCar-v0", render_mode="human")
-state = normalize(env_test.reset()[0])
-agent.epsilon = 0.0
-done = False
-total_reward = 0
 
-while not done:
-    action = agent.get_action(state)
-    next_raw, reward, terminated, truncated, _ = env_test.step(action)
-    state = normalize(next_raw)
-    done = terminated or truncated
-    total_reward += reward
-    env_test.render()
-    time.sleep(0.02)
+num_test_episodes = 5
+rewards = []
+for i in range(num_test_episodes):
 
-print("🎉 최종 테스트 보상:", total_reward)
+    env_test = gym.make("MountainCar-v0", render_mode="rgb_array")
+
+    agent.epsilon = 0
+    state = normalize(env_test.reset()[0])
+    done = False
+    total_reward = 0
+    frames = []
+
+    while not done:
+        frame = env_test.render()
+        if frame is not None:
+            frames.append(frame)
+
+        action = agent.get_action(state)
+        next_state, reward, terminated, truncated, info = env_test.step(action)
+        done = terminated | truncated
+        state = next_state
+        total_reward += reward
+        # env_test.render()
+    rewards.append(total_reward)
+    video_path = os.path.join(exp_dir, f"test_episode_{i+1}_{total_reward}.mp4")
+    print("최종 테스트 보상:", total_reward)
+    clip = ImageSequenceClip(frames, fps=30)
+    clip.write_videofile(video_path, codec="libx264")
+    print(f"테스트 에피소드 {i+1} 보상: {total_reward} (동영상 저장 완료)")
+
+
+with open(os.path.join(exp_dir, "rewards.txt"), "w", encoding="utf-8") as f:
+    for idx, r in enumerate(rewards):
+        f.write(f"에피소드 {idx+1}: {r}\n")
+    f.write(f"최대 보상: {max(rewards)}\n")
+
 env_test.close()
+print("완료")
