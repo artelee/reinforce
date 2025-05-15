@@ -7,3 +7,6 @@
 .env.production.local
 
 saved_models/
+
+test_results/
+__pycache__/

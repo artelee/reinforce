@@ -124,8 +124,6 @@ for episode in range(episodes):
         action = agent.get_action(state)
         next_state, reward, terminated, truncated, info = env.step(action)
         done = terminated | truncated
-        # reward = custom_reward(state, action, next_state)
-
         agent.update(state, action, reward, next_state, done)
         state = next_state
         total_reward += reward
